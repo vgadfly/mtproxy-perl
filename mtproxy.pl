@@ -9,12 +9,14 @@ use AnyEvent::Handle;
 use Digest::SHA qw(sha256);
 use Crypt::CTR;
 use Crypt::OpenSSL::AES;
+use Crypt::OpenSSL::Random;
 
 my $cv = AE::cv;
 
-my $host = '127.0.0.1';
-my $port = 1443;
+my $host = '0.0.0.0';
+my $port = 2443;
 my %connections;
+my @telegram_servers = qw( 149.154.175.50 149.154.167.51 149.154.175.100 149.154.167.91 149.154.171.5 );
 
 my $secret_hex = $ARGV[0];
 
@@ -28,15 +30,15 @@ say "secret ", unpack("H*", $secret);
 tcp_server( $host, $port, sub {
         my ($fh, $host, $port) = @_;
 
-        print "Connected...\n";
+	AE::log info => "$host connected...";
 
         my $handle;
         $handle = AnyEvent::Handle->new(
             fh => $fh,
             on_read => sub {
                 my $h = shift;
-                AE::log debug => "Received: " . length($h->rbuf) . "\n";
-                unless (defined $connections{$handle}{cipher}) {
+                AE::log debug => "Received: " . length($h->{rbuf}) . "\n";
+                unless (defined $connections{$fh}{cipher}) {
 
                     ## initialization packet
                     ## ???(8) | enc_key(32) | enc_iv(16) | ???(8)
@@ -44,32 +46,36 @@ tcp_server( $host, $port, sub {
                     ## ???(8) | dec_iv_rev(16) | dec_key(32) | ???(8)
                     $h->unshift_read( chunk => 64, sub {
                             my $initpak = $_[1];
+                            AE::log debug => length $_[1];
                             my $initrev = reverse $initpak;
 
-                            AE::log debug => unpack("H*", $initpak);
+                            #AE::log debug => unpack("H*", $initpak);
 
-                            my $enc_k = substr($initpak, 8, 32);
-                            my $enc_iv = substr($initpak, 40, 16);
+                            my $dec_k = substr($initpak, 8, 32);
+                            my $dec_iv = substr($initpak, 40, 16);
                             
-                            my $dec_k = substr($initrev, 8, 32);
-                            my $dec_iv = substr($initrev, 40, 16);
+                            my $enc_k = substr($initrev, 8, 32);
+                            my $enc_iv = substr($initrev, 40, 16);
 
                             $enc_k = sha256($enc_k . $secret);
                             $dec_k = sha256($dec_k . $secret);
 
-                            $connections{$_[0]}{cipher}{enc} = Crypt::CTR->new(
+                            $connections{$fh}{cipher}{enc} = Crypt::CTR->new(
                                 -key => $enc_k,
                                 -iv => $enc_iv,
                                 -cipher => 'Crypt::OpenSSL::AES'
                             );
                             
-                            $connections{$_[0]}{cipher}{dec} = Crypt::CTR->new(
+                            $connections{$fh}{cipher}{dec} = Crypt::CTR->new(
                                 -key => $dec_k,
                                 -iv => $dec_iv,
                                 -cipher => 'Crypt::OpenSSL::AES'
                             );
 
-                            my $dec_init = $connections{$_[0]}{cipher}{enc}->decrypt($initpak);
+			    #AE::log debug => "K=".unpack("H*", $dec_k);
+			    #AE::log debug => "IV=".unpack("H*", $dec_iv);
+
+                            my $dec_init = $connections{$fh}{cipher}{dec}->decrypt($initpak);
 
                             unless (unpack("L", substr($dec_init, 56, 4)) == 0xefefefef) {
                                 AE::log warn => "bad key block";
@@ -79,22 +85,81 @@ tcp_server( $host, $port, sub {
 
                             my $dc = unpack("s<", substr($dec_init, 60, 2));
                             AE::log info => "request for #$dc";
+                            if ( $dc < 1 or $dc > 5 ) {
+                                AE::log warn => "bad DC id";
+                                $_[0]->destroy;
+                                delete $connections{$_[0]};
+
+                            }
+                            
+                            tcp_connect( $telegram_servers[$dc-1], 443, sub {
+                                    my $sfh = shift;
+                                    return unless $sfh;
+                                    AE::log info => "connected to #%d, %s", $dc, $telegram_servers[$dc-1];
+
+                                    my $sh = AnyEvent::Handle->new( 
+                                        fh => $sfh,
+                                        on_read => sub {
+						my $data = $_[0]->{rbuf};
+						AE::log debug => "server -> client %d", length($data);
+						AE::log debug => unpack("H*", $data);
+						$_[0]->{rbuf} = '';
+						#$data .= Crypt::OpenSSL::Random::random_pseudo_bytes(
+						#	-length($data) % 16
+						#) if length($data) % 16;
+						my $enc_data = $connections{$fh}{cipher}{enc}->encrypt( $data );
+						$h->push_write( $enc_data );
+						AE::log debug => "%d bytes sent", length($enc_data);
+                                        },
+					on_error => sub { AE::log warn => "socket error"},
+					on_eof => sub { AE::log warn => "socket closed"}
+                                    );
+
+                                    $sh->push_write( "\xef" );
+                                    $connections{$fh}{server} = $sh;
+                                    
+                                    $h->unshift_read( sub {
+                                            AE::log debug => "some data left: %d", length($_[0]->{rbuf});
+                                            if ( length( $_[0]->{rbuf}) > 16) {
+                                                my $data = $connections{$fh}{cipher}{dec}->decrypt( $_[0]->{rbuf} );
+                                                AE::log debug => unpack("H*", $data);
+                                                $connections{$fh}{server}->push_write( $data );
+                                                $_[0]->{rbuf} = '';
+                                                return 1;
+                                            } 
+                                            return 0;
+                                        }
+                                    );
+                                } 
+                            );
+                        } 
+                    );
+                }
+                elsif ( defined $connections{$fh}{server} ) {
+                    $h->unshift_read( sub {
+                            my $data = $_[0]->{rbuf};
+                            AE::log debug => "more data recvd: %d", length($data);
+                            my $data = $connections{$fh}{cipher}{dec}->decrypt( $data );
+                            AE::log debug => unpack("H*", $data);
+                            $connections{$fh}{server}->push_write( $data );
+                            $_[0]->{rbuf} = '';
+			    return 1;
                         } 
                     );
                 }
             },
             on_eof => sub {
                 my $h = shift;
-                AE::log info => "EOF on " . $connections{$h}{host};
+                AE::log info => "EOF on " . $connections{$fh}{host};
                 $h->destroy;
             },
             on_error => sub {
                 my $h = shift;
-                AE::log info => "Error on " . $connections{$h}{host};
+                AE::log info => "Error on " . $connections{$fh}{host};
                 $h->destroy;
             }
         );
-        $connections{$handle} = { 
+        $connections{$fh} = { 
             client => $handle,
             host => $host,
             port => $port
