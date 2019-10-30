@@ -150,6 +150,7 @@ sub from_client
 
                 my $dc = unpack("s<", substr($dec_init, 60, 2));
                 AE::log info => "request for #$dc";
+                $dc = abs( $dc );
                 if ( $dc < 1 or $dc > 5 ) {
                     AE::log warn => "bad DC id";
                     $_[0]->destroy;
